@@ -61,13 +61,14 @@ class GraspInference:
         self.transunet = ViT_seg(config_vit, img_size=self.img_size, num_classes=self.num_seg_classes).to(self.device)
         print(f"DEBUG: dir={os.getcwd()}")
         state_dict = torch.load("/root/graspnet_ws/src/graspnet/src/graspnet/TU_mixed480/TU_pretrain_R50-ViT-B_16_skip3_epo150_bs4_480/epoch_149.pth")
+        state_dict = torch.load("/root/graspnet_ws/src/graspnet/src/graspnet/TU_mixed480/TU_pretrain_R50-ViT-B_16_skip3_epo150_bs4_480/epoch_149.pth")
         state_dict = {k: v for k, v in state_dict.items() if not k.startswith('grasp_head')}
         self.transunet.load_state_dict(state_dict, strict=False)
         self.transunet.eval()
 
         # Load GraspNet
         self.graspnet = GraspNet(input_channels=self.input_channels).to(self.device)
-        self.graspnet.load_state_dict(torch.load("/root/graspnews/src/graspnet/src/graspnet/graspnet.pth"))
+        self.graspnet.load_state_dict(torch.load("/root/graspnet_ws/src/graspnet/src/graspnet/graspnet.pth"))
         self.graspnet.eval()
 
     def image_callback(self, colour_msg, depth_msg):
