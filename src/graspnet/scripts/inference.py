@@ -4,6 +4,7 @@ import rospy
 import torch
 import numpy as np
 import cv2
+import tf
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray
@@ -12,23 +13,35 @@ from graspnet.networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from graspnet.networks.graspnet_model import GraspNet
 from sklearn.cluster import DBSCAN, HDBSCAN
 from graspnet.msg import GraspMessage
+import message_filters
+import json
 
 class GraspInference:
     def __init__(self):
         # ROS setup
         rospy.init_node("grasp_inference", anonymous=True)
         self.bridge = CvBridge()
-        self.image_sub = rospy.Subscriber("/nakit_vision/color/image_raw", Image, self.image_callback)
+        self.image_sub = message_filters.Subscriber(["/nakit_vision/color/image_raw", "/nakit_vision/depth/image_raw"], Image)
+        self.image_sub.registerCallback(self.image_callback)
         
         # Parameters
         self.visualize = rospy.get_param('~visualize', False)  # Default: False
         self.heatmap_threshold = rospy.get_param('~heatmap_threshold', 0.3)
+
+        self.camera_params = json.load(open("/root/graspnet_ws/src/graspnet/src/graspnet/RS_d405_calib.json"))
+        self.fx = self.camera_params['rectified.2.fx']
+        self.cx = self.camera_params['rectified.2.ppx']
+        self.fy = self.camera_params['rectified.2.fy']
+        self.cy = self.camera_params['rectified.2.ppy']
         
         # Output publishers
         self.grasp_pub = rospy.Publisher('/grasp_detections', GraspMessage, queue_size=1)
         self.class_pub = rospy.Publisher('/object_classes', Float32MultiArray, queue_size=1)
         self.overlay_pub = rospy.Publisher('/grasp_inference/overlay_seg', Image, queue_size=1)
         self.heatmap_pub = rospy.Publisher('/grasp_inference/overlay_heatmap', Image, queue_size=1)
+
+        #Initialise TF publisher
+        self.tf_broadcaster = tf.TransformBroadcaster()
         
         # Neural network setup
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -47,20 +60,21 @@ class GraspInference:
 
         self.transunet = ViT_seg(config_vit, img_size=self.img_size, num_classes=self.num_seg_classes).to(self.device)
         print(f"DEBUG: dir={os.getcwd()}")
-        state_dict = torch.load("/root/catkin_ws/src/graspnet/src/graspnet/TU_mixed480/TU_pretrain_R50-ViT-B_16_skip3_epo150_bs4_480/epoch_149.pth")
+        state_dict = torch.load("/root/graspnet_ws/src/graspnet/src/graspnet/TU_mixed480/TU_pretrain_R50-ViT-B_16_skip3_epo150_bs4_480/epoch_149.pth")
         state_dict = {k: v for k, v in state_dict.items() if not k.startswith('grasp_head')}
         self.transunet.load_state_dict(state_dict, strict=False)
         self.transunet.eval()
 
         # Load GraspNet
         self.graspnet = GraspNet(input_channels=self.input_channels).to(self.device)
-        self.graspnet.load_state_dict(torch.load("/root/catkin_ws/src/graspnet/src/graspnet/graspnet.pth"))
+        self.graspnet.load_state_dict(torch.load("/root/graspnews/src/graspnet/src/graspnet/graspnet.pth"))
         self.graspnet.eval()
 
-    def image_callback(self, msg):
+    def image_callback(self, colour_msg, depth_msg):
         try:
             # Convert ROS Image message to OpenCV format
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            cv_image = self.bridge.imgmsg_to_cv2(colour_msg, desired_encoding="bgr8")
+            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
             cv_image_resized = cv_image[:480, 70:550]
             image_tensor = torch.tensor(cv_image_resized).permute(2, 0, 1).unsqueeze(0).float().to(self.device) / 255.0
 
@@ -68,7 +82,7 @@ class GraspInference:
             seg_probs, heatmap_pred, orientation_pred, confidence_pred = self.run_inference(image_tensor)
             
             # Process and publish results
-            present_classes = self.process_results(image_tensor, seg_probs, heatmap_pred, orientation_pred, confidence_pred)
+            present_classes = self.process_results(depth_image, seg_probs, heatmap_pred, orientation_pred)
             
             overlay = self.create_segmentation_overlay(image_tensor, seg_probs)
             hm_overlay = self.create_heatmap_overlay(image_tensor, heatmap_pred, orientation_pred, present_classes)
@@ -95,13 +109,12 @@ class GraspInference:
         
         return seg_probs, heatmap_pred, orientation_pred, confidence_pred
 
-    def process_results(self, image_tensor, seg_probs, heatmap_pred, orientation_pred, confidence_pred):
+    def process_results(self, depth_img, seg_probs, heatmap_pred, orientation_pred ):
         seg_probs_np = seg_probs[0].cpu().numpy()  # [C, H, W]
         heatmap_np = heatmap_pred[0, 0].cpu().numpy()
         orientation_np = orientation_pred[0].cpu().numpy()
 
         present_classes = []
-        grasp_data = []
 
         for class_id in range(self.num_seg_classes):
             class_prob_map = seg_probs_np[class_id]
@@ -132,13 +145,16 @@ class GraspInference:
                         cx, cy = cluster_center
                         confidence = heatmap_np[cy, cx]
 
+                        cx_uncut, cy_uncut = int(cx + 70), int(cy)  # Adjust for original image size
+                        depth = depth_img[cy_uncut, cx_uncut]
+
+                        camera_pos = self.uv_to_XY(cx_uncut, cy_uncut, depth/10)
+
                         # Get orientations as the average orientation in the cluster
                         orientations = orientation_np[:, y, x]
                         u = orientations[0, clustering.labels_ == cluster_id].mean()
                         v = orientations[1, clustering.labels_ == cluster_id].mean()    
 
-                        grasp_data.append([class_id, presence_prob, cx, cy, u, v, confidence])
-        
                         # Create and publish GraspMessage
                         grasp_msg = GraspMessage()
                         grasp_msg.header.stamp = rospy.Time.now()
@@ -146,14 +162,20 @@ class GraspInference:
                         grasp_msg.presence_prob = float(presence_prob)  # Ensure it's a float
                         grasp_msg.cx = int(cx)  # Ensure it's an integer
                         grasp_msg.cy = int(cy)  # Ensure it's an integer
-                        grasp_msg.u = float(u)  # Ensure it's a float
-                        grasp_msg.v = float(v)  # Ensure it's a float
+                        grasp_msg.position_camera = camera_pos  # Ensure it's a list
+                        grasp_msg.orientation = [u, v]
                         grasp_msg.confidence = float(confidence)  # Ensure it's a float
         
                         self.grasp_pub.publish(grasp_msg)
+                        self.tf_broadcaster.sendTransform(
+                            (camera_pos[0], camera_pos[1], camera_pos[2]),
+                            tf.transformations.quaternion_from_euler(0, 0, np.arctan2(v, u)),
+                            rospy.Time.now(),
+                            f"grasp_{class_id}",
+                            "rs_left_imager"
+                        )
 
         rospy.loginfo(f"Detected classes: {present_classes}")
-        rospy.loginfo(f"Published {len(grasp_data)} grasp points across {len(present_classes)} classes")
 
         return present_classes
 
@@ -264,6 +286,35 @@ class GraspInference:
             cv2.arrowedLine(overlay, (cx, cy), arrow_end, (255, 0, 0), 2, tipLength=0.3)
 
         return overlay
+
+    def uv_to_XY(self, u:int,v:int, z:int) -> list:
+        """
+        Convert pixel coordinated (u,v) from realsense camera
+        into real world coordinates X,Y,Z 
+
+        Args
+        ----
+            u(int) : Horizontal coordinate
+
+            v(int) : Vertical coordinate
+
+            z(int) : Depth coordinate
+
+        Returns
+        -------
+            worldPos(list) : Real world position (in respect to camera)
+        """
+        
+        x = (u - (self.cx)) / self.fx
+
+        y = (v - (self.cy)) / self.fy
+
+        X = (z * x)/1000
+        Y = (z * y)/1000
+        Z = z/1000
+
+        worldPos = [X, Y, Z]
+        return worldPos
 
 if __name__ == "__main__":
     try:
