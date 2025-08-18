@@ -15,24 +15,28 @@ from sklearn.cluster import DBSCAN, HDBSCAN
 from graspnet.msg import GraspMessage
 import message_filters
 import json
+import matplotlib.pyplot as plt
 
 class GraspInference:
     def __init__(self):
         # ROS setup
         rospy.init_node("grasp_inference", anonymous=True)
         self.bridge = CvBridge()
-        self.image_sub = message_filters.Subscriber(["/nakit_vision/color/image_raw", "/nakit_vision/depth/image_raw"], Image)
-        self.image_sub.registerCallback(self.image_callback)
+        self.colour_sub = message_filters.Subscriber("/nakit_vision/color/image_raw", Image)
+        self.depth_sub = message_filters.Subscriber("/nakit_vision/depth/image_raw", Image)
+
+        self.ts = message_filters.ApproximateTimeSynchronizer([self.colour_sub, self.depth_sub], queue_size=5, slop=0.1)
+        self.ts.registerCallback(self.image_callback)
         
         # Parameters
         self.visualize = rospy.get_param('~visualize', False)  # Default: False
-        self.heatmap_threshold = rospy.get_param('~heatmap_threshold', 0.3)
+        self.heatmap_threshold = rospy.get_param('~heatmap_threshold', 0.1)
 
         self.camera_params = json.load(open("/root/graspnet_ws/src/graspnet/src/graspnet/RS_d405_calib.json"))
-        self.fx = self.camera_params['rectified.2.fx']
-        self.cx = self.camera_params['rectified.2.ppx']
-        self.fy = self.camera_params['rectified.2.fy']
-        self.cy = self.camera_params['rectified.2.ppy']
+        self.cx = float(self.camera_params['rectified.2.ppx'])
+        self.fx = float(self.camera_params['rectified.2.fx'])
+        self.cy = float(self.camera_params['rectified.2.ppy'])
+        self.fy = float(self.camera_params['rectified.2.fy'])
         
         # Output publishers
         self.grasp_pub = rospy.Publisher('/grasp_detections', GraspMessage, queue_size=1)
@@ -83,7 +87,7 @@ class GraspInference:
             seg_probs, heatmap_pred, orientation_pred, confidence_pred = self.run_inference(image_tensor)
             
             # Process and publish results
-            present_classes = self.process_results(depth_image, seg_probs, heatmap_pred, orientation_pred)
+            present_classes = self.process_results(depth_image, seg_probs, heatmap_pred, orientation_pred, confidence_pred)
             
             overlay = self.create_segmentation_overlay(image_tensor, seg_probs)
             hm_overlay = self.create_heatmap_overlay(image_tensor, heatmap_pred, orientation_pred, present_classes)
@@ -110,30 +114,45 @@ class GraspInference:
         
         return seg_probs, heatmap_pred, orientation_pred, confidence_pred
 
-    def process_results(self, depth_img, seg_probs, heatmap_pred, orientation_pred ):
+    def process_results(self, depth_img, seg_probs, heatmap_pred, orientation_pred, confidence_pred):
         seg_probs_np = seg_probs[0].cpu().numpy()  # [C, H, W]
         heatmap_np = heatmap_pred[0, 0].cpu().numpy()
+        confidence_np = confidence_pred[0, 0].cpu().numpy()
         orientation_np = orientation_pred[0].cpu().numpy()
 
+        
+        
         present_classes = []
 
-        for class_id in range(self.num_seg_classes):
+        for class_id in range(1, self.num_seg_classes):
+
             class_prob_map = seg_probs_np[class_id]
             presence_prob = float(class_prob_map.mean())
             
-            if presence_prob > 0.03:  # filter out low-confidence classes
+            if presence_prob > 0.01:  # filter out low-confidence classes
                 present_classes.append((class_id, presence_prob))
 
-                # Mask the heatmap with the segmentation class
-                mask = class_prob_map > 0.3  # pixel-level thresholding
+                if class_id == 23:
+                    plt.imsave(f"kosamona_23.png", class_prob_map, cmap='jet')
+                if class_id == 25:
+                    plt.imsave(f"kosamona_25.png", class_prob_map, cmap='jet')
+                location = np.unravel_index(np.argmax(class_prob_map), class_prob_map.shape)
+                print(f"DEBUG: class_id={class_id}, Most_likely location={location}, presence_prob={np.max(class_prob_map)}, mean={presence_prob}")
+
+                mask = (class_prob_map > 0.1).astype(np.float32)
                 heatmap_masked = heatmap_np * mask
+                heatmap_masked = np.where(mask > 0, heatmap_np, 0)  # More explicit
+                
                 y, x = np.where(heatmap_masked > self.heatmap_threshold)
 
                 if len(x) > 0:
                     # Prepare data for clustering
                     points = np.column_stack((x, y))
-                    clustering = DBSCAN(eps=10, min_samples=40).fit(points)
+                    clustering = DBSCAN(eps=20, min_samples=1).fit(points)
 
+                    print(clustering.labels_)
+                    confidences = []
+                    centers = []
                     for cluster_id in set(clustering.labels_):
                         if cluster_id == -1:  # Ignore noise points
                             continue
@@ -145,36 +164,41 @@ class GraspInference:
                         # Get confidence at the cluster center
                         cx, cy = cluster_center
                         confidence = heatmap_np[cy, cx]
+                        
+                        confidences.append(confidence)
+                        centers.append((cx, cy))
 
-                        cx_uncut, cy_uncut = int(cx + 70), int(cy)  # Adjust for original image size
-                        depth = depth_img[cy_uncut, cx_uncut]
+                    cx, cy = centers[np.argmax(confidences)]
 
-                        camera_pos = self.uv_to_XY(cx_uncut, cy_uncut, depth/10)
+                    cx_uncut, cy_uncut = int(cx + 70), int(cy)  # Adjust for original image size
+                    depth = depth_img[cy_uncut, cx_uncut]
 
-                        # Get orientations as the average orientation in the cluster
-                        orientations = orientation_np[:, y, x]
-                        u = orientations[0, clustering.labels_ == cluster_id].mean()
-                        v = orientations[1, clustering.labels_ == cluster_id].mean()    
+                    camera_pos = self.uv_to_XY(cx_uncut, cy_uncut, depth/10)
 
-                        # Create and publish GraspMessage
-                        grasp_msg = GraspMessage()
-                        grasp_msg.header.stamp = rospy.Time.now()
-                        grasp_msg.class_id = int(class_id)  # Ensure it's an integer
-                        grasp_msg.presence_prob = float(presence_prob)  # Ensure it's a float
-                        grasp_msg.cx = int(cx)  # Ensure it's an integer
-                        grasp_msg.cy = int(cy)  # Ensure it's an integer
-                        grasp_msg.position_camera = camera_pos  # Ensure it's a list
-                        grasp_msg.orientation = [u, v]
-                        grasp_msg.confidence = float(confidence)  # Ensure it's a float
-        
-                        self.grasp_pub.publish(grasp_msg)
-                        self.tf_broadcaster.sendTransform(
-                            (camera_pos[0], camera_pos[1], camera_pos[2]),
-                            tf.transformations.quaternion_from_euler(0, 0, np.arctan2(v, u)),
-                            rospy.Time.now(),
-                            f"grasp_{class_id}",
-                            "rs_left_imager"
-                        )
+                    # Get orientations as the average orientation in the cluster
+                    orientations = orientation_np[:, y, x]
+                    u = orientations[0, clustering.labels_ == cluster_id].mean()
+                    v = orientations[1, clustering.labels_ == cluster_id].mean()    
+
+                    # Create and publish GraspMessage
+                    grasp_msg = GraspMessage()
+                    grasp_msg.header.stamp = rospy.Time.now()
+                    grasp_msg.class_id = int(class_id)  # Ensure it's an integer
+                    grasp_msg.presence_prob = float(presence_prob)  # Ensure it's a float
+                    grasp_msg.cx = int(cx_uncut)  # Ensure it's an integer
+                    grasp_msg.cy = int(cy_uncut)  # Ensure it's an integer
+                    grasp_msg.position_camera = camera_pos  # Ensure it's a list
+                    grasp_msg.orientation = [u, v]
+                    grasp_msg.confidence = float(confidence)  # Ensure it's a float
+    
+                    self.grasp_pub.publish(grasp_msg)
+                    self.tf_broadcaster.sendTransform(
+                        (camera_pos[0], camera_pos[1], camera_pos[2]),
+                        tf.transformations.quaternion_from_euler(0, 0, np.arctan2(v, u)),
+                        rospy.Time.now(),
+                        f"grasp_{class_id}",
+                        "rs_left_imager"
+                    )
 
         rospy.loginfo(f"Detected classes: {present_classes}")
 
@@ -213,6 +237,7 @@ class GraspInference:
 
         
     def create_heatmap_overlay(self, image_tensor, heatmap_pred, orientation_pred, present_classes=None):
+        # import ipdb; ipdb.set_trace(context=10)
         image_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         heatmap_np = heatmap_pred[0, 0].cpu().numpy()
         orientation_np = orientation_pred[0].cpu().numpy()
@@ -225,13 +250,13 @@ class GraspInference:
         y, x = np.where(heatmap_np > self.heatmap_threshold)
         if len(x) == 0:
             rospy.logwarn("No points found in heatmap for overlay")
-            return cv2.addWeighted(image_np, 0.7, heatmap_colored, 0.3, 0)
+            return cv2.addWeighted(image_np, 0.5, heatmap_colored, 0.5, 0)
 
         # Prepare data for clustering
         points = np.column_stack((x, y))
 
         # Perform HDBSCAN clustering
-        clustering = HDBSCAN(min_cluster_size=20, min_samples=20).fit(points)
+        clustering = HDBSCAN(min_cluster_size=20, min_samples=1).fit(points)
 
         # Overlay heatmap on the original image
         overlay = cv2.addWeighted(image_np, 0.7, heatmap_colored, 0.3, 0)
@@ -272,10 +297,16 @@ class GraspInference:
             contours, _ = cv2.findContours(cluster_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             # Determine the color for the contour
-            color = (0, 255, 0)  # Default: green
-            for class_id, (highest_cluster_id, _) in highest_confidence_clusters.items():
-                if cluster_id == highest_cluster_id:
-                    color = (0, 0, 255)  # Red for the highest confidence cluster of this class
+            # color = (0, 255, 0)  # Default: green
+            # for class_id, (highest_cluster_id, _) in highest_confidence_clusters.items():
+            #     if cluster_id == highest_cluster_id:
+            #         color = (0, 0, 255)  # Red for the highest confidence cluster of this class
+
+            
+            # Show all valid clusters with different colors:
+            colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (255, 255, 0), (255, 0, 255)]
+            color = colors[cluster_id % len(colors)]  # Cycle through colors
+            
 
             cv2.drawContours(overlay, contours, -1, color, 2)
 
@@ -314,7 +345,7 @@ class GraspInference:
         Y = (z * y)/1000
         Z = z/1000
 
-        worldPos = [X, Y, Z]
+        worldPos = [-X, -Y, Z]
         return worldPos
 
 if __name__ == "__main__":
