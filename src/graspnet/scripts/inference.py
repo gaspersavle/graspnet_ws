@@ -25,12 +25,12 @@ class GraspInference:
         self.colour_sub = message_filters.Subscriber("/nakit_vision/color/image_raw", Image)
         self.depth_sub = message_filters.Subscriber("/nakit_vision/depth/image_raw", Image)
 
-        self.ts = message_filters.ApproximateTimeSynchronizer([self.colour_sub, self.depth_sub], queue_size=5, slop=0.1)
+        self.ts = message_filters.ApproximateTimeSynchronizer([self.colour_sub, self.depth_sub], queue_size=20, slop=0.5)
         self.ts.registerCallback(self.image_callback)
         
         # Parameters
         self.visualize = rospy.get_param('~visualize', False)  # Default: False
-        self.heatmap_threshold = rospy.get_param('~heatmap_threshold', 0.1)
+        self.heatmap_threshold = rospy.get_param('~heatmap_threshold', 0.5)
 
         self.camera_params = json.load(open("/root/graspnet_ws/src/graspnet/src/graspnet/RS_d405_calib.json"))
         self.cx = float(self.camera_params['rectified.2.ppx'])
@@ -129,7 +129,7 @@ class GraspInference:
             class_prob_map = seg_probs_np[class_id]
             presence_prob = float(class_prob_map.mean())
             
-            if presence_prob > 0.01:  # filter out low-confidence classes
+            if presence_prob > 0.03:  # filter out low-confidence classes
                 present_classes.append((class_id, presence_prob))
 
                 if class_id == 23:
@@ -139,7 +139,7 @@ class GraspInference:
                 location = np.unravel_index(np.argmax(class_prob_map), class_prob_map.shape)
                 print(f"DEBUG: class_id={class_id}, Most_likely location={location}, presence_prob={np.max(class_prob_map)}, mean={presence_prob}")
 
-                mask = (class_prob_map > 0.1).astype(np.float32)
+                mask = (class_prob_map > 0.3).astype(np.float32)
                 heatmap_masked = heatmap_np * mask
                 heatmap_masked = np.where(mask > 0, heatmap_np, 0)  # More explicit
                 
@@ -148,7 +148,7 @@ class GraspInference:
                 if len(x) > 0:
                     # Prepare data for clustering
                     points = np.column_stack((x, y))
-                    clustering = DBSCAN(eps=20, min_samples=1).fit(points)
+                    clustering = DBSCAN(eps=20, min_samples=10).fit(points)
 
                     print(clustering.labels_)
                     confidences = []
@@ -256,7 +256,7 @@ class GraspInference:
         points = np.column_stack((x, y))
 
         # Perform HDBSCAN clustering
-        clustering = HDBSCAN(min_cluster_size=20, min_samples=1).fit(points)
+        clustering = HDBSCAN(min_cluster_size=20, min_samples=10).fit(points)
 
         # Overlay heatmap on the original image
         overlay = cv2.addWeighted(image_np, 0.7, heatmap_colored, 0.3, 0)
@@ -345,7 +345,7 @@ class GraspInference:
         Y = (z * y)/1000
         Z = z/1000
 
-        worldPos = [-X, -Y, Z]
+        worldPos = [X, Y, Z]
         return worldPos
 
 if __name__ == "__main__":

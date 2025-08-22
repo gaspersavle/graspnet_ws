@@ -51,7 +51,6 @@ requests==2.31.0
 requests-oauthlib==2.0.0
 rsa==4.9.1
 scikit-image==0.19.3
-scikit-learn
 scipy==1.7.3
 SimpleITK==2.2.1
 six==1.17.0
